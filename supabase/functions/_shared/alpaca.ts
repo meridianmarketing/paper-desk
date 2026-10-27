@@ -83,7 +83,7 @@ export async function snapshot(strategy_id: string, equity: number, cash: number
 export async function strategyEquity(strategy_id: string, markPrices: Record<string, number>) {
   const { data: s } = await sb.from("strategies").select("*").eq("id", strategy_id).single();
   const { data: closed } = await sb.from("trades").select("net_pnl").eq("strategy_id", strategy_id).not("exited_at", "is", null);
-  const { data: open } = await sb.from("trades").select("id,ticker,entry_price,qty,entered_at,fees").eq("strategy_id", strategy_id).is("exited_at", null);
+  const { data: open } = await sb.from("trades").select("id,ticker,entry_price,qty,entered_at,fees,high_water").eq("strategy_id", strategy_id).is("exited_at", null);
   const realized = (closed ?? []).reduce((a, t) => a + Number(t.net_pnl ?? 0), 0);
   let unreal = 0, invested = 0;
   for (const t of open ?? []) {

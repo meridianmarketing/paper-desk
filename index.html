@@ -83,10 +83,10 @@ tr:last-child td{border-bottom:0}
     <div class="cards" id="cards"></div>
     <h2>Equity vs SPY, last 7 days</h2>
     <canvas id="chart" width="800" height="340"></canvas>
-    <div class="legend"><span><i style="background:#4a7fd6"></i>A momentum</span><span><i style="background:#d98c2b"></i>B stocks</span><span><i style="background:#8a4fd6"></i>C crypto</span><span><i style="background:#888"></i>SPY</span></div>
+    <div class="legend"><span><i style="background:#4a7fd6"></i>A momentum</span><span><i style="background:#d98c2b"></i>B stocks</span><span><i style="background:#8a4fd6"></i>C crypto</span><span><i style="background:#2a9d8f"></i>D crypto trail</span><span><i style="background:#888"></i>SPY</span></div>
     <button id="red" class="danger">Flatten everything and halt</button>
     <div id="redconfirm" class="confirm" hidden>
-      <div class="msg">This closes every open position at market and disarms all three strategies. Confirm?</div>
+      <div class="msg">This closes every open position at market and disarms every strategy. Confirm?</div>
       <div class="arm"><button id="redyes" class="danger" style="margin:0">Yes, flatten now</button><button id="redno">Cancel</button></div>
     </div>
   </section>
@@ -98,7 +98,7 @@ tr:last-child td{border-bottom:0}
 
   <section id="view-trades" hidden>
     <h2>Trades</h2>
-    <div class="filters" id="tfilters"><button data-s="" aria-pressed="true">All</button><button data-s="A">A</button><button data-s="B">B</button><button data-s="C">C</button></div>
+    <div class="filters" id="tfilters"><button data-s="" aria-pressed="true">All</button><button data-s="A">A</button><button data-s="B">B</button><button data-s="C">C</button><button data-s="D">D</button></div>
     <div class="tbl"><table id="trades"></table></div>
   </section>
 
@@ -131,7 +131,7 @@ const $ = (s) => document.querySelector(s);
 const fmt$ = (n) => (n < 0 ? "-" : "") + "$" + Math.abs(Number(n)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const pct = (a, b) => ((a / b - 1) * 100).toFixed(2) + "%";
 const when = (t) => new Date(t).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-const COLORS = { A: "#4a7fd6", B: "#d98c2b", C: "#8a4fd6", SPY: "#888" };
+const COLORS = { A: "#4a7fd6", B: "#d98c2b", C: "#8a4fd6", D: "#2a9d8f", SPY: "#888" };
 
 async function boot() {
   const { data: { session } } = await sb.auth.getSession();
@@ -194,7 +194,7 @@ async function loadChart() {
   const css = getComputedStyle(document.documentElement);
   ctx.clearRect(0, 0, c.width, c.height);
   if (!data?.length) { ctx.fillStyle = css.getPropertyValue("--muted"); ctx.font = "16px IBM Plex Sans, sans-serif"; ctx.fillText("No snapshots yet. First one lands within 5 minutes.", 20, 40); return; }
-  const series = { A: [], B: [], C: [], SPY: [] };
+  const series = { A: [], B: [], C: [], D: [], SPY: [] };
   const spy0 = data.find((d) => d.spy_price)?.spy_price;
   for (const d of data) {
     series[d.strategy_id]?.push([new Date(d.taken_at).getTime(), Number(d.equity) / 10000 * 100]);

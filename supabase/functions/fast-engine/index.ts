@@ -5,14 +5,15 @@ type Bar = { t: string; o: number; h: number; l: number; c: number; v: number };
 type Cfg = {
   tickers: string[]; target_pct: number; stop_pct: number; max_hold_min: number; max_positions: number;
   vwap_dip_pct: number; breakout_bars: number; vol_mult: number; spread_pct: number; pdt_cap?: number; fee_pct_side?: number;
+  trail_arm_pct?: number; trail_pct?: number; // D: trailing stop instead of fixed target
 };
 
-/** Runs every minute. ?strategy=B (stocks, market hours) or ?strategy=C (crypto, 24/7). */
+/** Runs every minute. ?strategy=B (stocks, market hours), C (crypto, fixed target) or D (crypto, trailing stop). */
 Deno.serve(async (req) => {
   if (!(await authorized(req))) return json({ error: "unauthorized" }, 401);
   const id = new URL(req.url).searchParams.get("strategy");
-  if (id !== "B" && id !== "C") return json({ error: "strategy must be B or C" }, 400);
-  const crypto = id === "C";
+  if (id !== "B" && id !== "C" && id !== "D") return json({ error: "strategy must be B, C or D" }, 400);
+  const crypto = id !== "B";
 
   // flatten-all?
   const { data: ctl } = await sb.from("control").select("*").eq("id", 1).single();
@@ -53,9 +54,20 @@ Deno.serve(async (req) => {
     const chg = (px / entry - 1) * 100;
     const held = (Date.now() - new Date((t as any).entered_at ?? Date.now()).getTime()) / 60e3;
     let reason: string | null = null;
-    if (chg >= cfg.target_pct) reason = "target";
-    else if (chg <= -cfg.stop_pct) reason = "stop";
-    else if (held >= cfg.max_hold_min) reason = "time";
+    if (cfg.trail_pct != null) {
+      // trailing stop: once up trail_arm_pct, stop follows the high by trail_pct
+      const hw = Math.max(Number((t as any).high_water ?? entry), px);
+      if (hw !== Number((t as any).high_water ?? 0)) await sb.from("trades").update({ high_water: hw }).eq("id", t.id);
+      const armed = (hw / entry - 1) * 100 >= cfg.trail_arm_pct!;
+      if (armed && (px / hw - 1) * 100 <= -cfg.trail_pct!) reason = "trail";
+      else if (!armed && chg <= -cfg.stop_pct) reason = "stop";
+      else if (held >= cfg.max_hold_min && !armed) reason = "time";
+      else if (held >= cfg.max_hold_min * 4) reason = "time"; // armed trades get longer, but not forever
+    } else {
+      if (chg >= cfg.target_pct) reason = "target";
+      else if (chg <= -cfg.stop_pct) reason = "stop";
+      else if (held >= cfg.max_hold_min) reason = "time";
+    }
     if (reason) await exitTrade(id, t, px, reason, feeSide, !crypto);
   }
 
@@ -158,7 +170,7 @@ async function exitTrade(id: string, t: any, px: number, reason: string, feeSide
 
 async function flattenAll(id: string) {
   const { data: open } = await sb.from("trades").select("*").eq("strategy_id", id).is("exited_at", null);
-  const crypto = id === "C";
+  const crypto = id !== "B";
   const cfg = (await sb.from("strategies").select("config").eq("id", id).single()).data!.config as Cfg;
   const quotes = crypto ? await alpaca.cryptoQuotes(cfg.tickers) : await alpaca.stockQuotes(cfg.tickers);
   for (const t of open ?? []) {
