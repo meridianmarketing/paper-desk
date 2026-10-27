@@ -7,6 +7,8 @@ type Cfg = {
   vwap_dip_pct: number; breakout_bars: number; vol_mult: number; spread_pct: number; pdt_cap?: number; fee_pct_side?: number;
   trail_arm_pct?: number; trail_pct?: number; // D: trailing stop instead of fixed target
   maker_fee_pct_side?: number; // fee when our resting limit order fills
+  trend_bars?: number; trend_min_pct?: number; // skip entries when 1h trend is down
+  dip_atr_mult?: number; dip_min_pct?: number; // dip threshold = max(dip_min_pct, dip_atr_mult * avg 1-min range)
 };
 
 /** Runs every minute. ?strategy=B (stocks, market hours), C (crypto, fixed target) or D (crypto, trailing stop). */
@@ -108,7 +110,16 @@ Deno.serve(async (req) => {
     const w20 = b.slice(-20);
     const vwap = w20.reduce((a, x) => a + ((x.h + x.l + x.c) / 3) * x.v, 0) / Math.max(1, w20.reduce((a, x) => a + x.v, 0));
     const dipPct = (vwap / px - 1) * 100; // how far below vwap we are
-    const dipHit = dipPct >= cfg.vwap_dip_pct && last.c > last.o && prev.c <= prev.o;
+    // adaptive dip threshold: a quiet coin needs a smaller dip than a wild one
+    const avgRangePct = w20.reduce((a, x) => a + ((x.h - x.l) / x.c) * 100, 0) / w20.length;
+    const dipThresh = cfg.dip_atr_mult ? Math.max(cfg.dip_min_pct ?? 0.4, cfg.dip_atr_mult * avgRangePct) : cfg.vwap_dip_pct;
+    const dipHit = dipPct >= dipThresh && last.c > last.o && prev.c <= prev.o;
+
+    // 1-hour trend filter: breakouts and dips both fail more in a falling market
+    const tb = cfg.trend_bars ?? 60;
+    const trendPct = b.length > tb ? (last.c / b.at(-tb - 1)!.c - 1) * 100 : 0;
+    const sma = b.slice(-tb).reduce((a, x) => a + x.c, 0) / Math.min(tb, b.length);
+    const downtrend = trendPct < (cfg.trend_min_pct ?? -0.5) && last.c < sma;
 
     const win = b.slice(-(cfg.breakout_bars + 1), -1);
     const hi = Math.max(...win.map((x) => x.h));
@@ -120,8 +131,9 @@ Deno.serve(async (req) => {
 
     let skip: string | null = null;
     if (spread[sym] > cfg.spread_pct) skip = `spread ${spread[sym].toFixed(3)}%`;
+    else if (downtrend) skip = `downtrend ${trendPct.toFixed(2)}%/1h`;
     else if (pdtLeft <= 0) skip = "PDT cap";
-    const { data: sig } = await sb.from("signals").insert({ strategy_id: id, ticker: sym, rule, price: px, acted: !skip, skip_reason: skip, detail: { vwap, dipPct, hi, vol: last.v, avgVol, spread: spread[sym] } }).select().single();
+    const { data: sig } = await sb.from("signals").insert({ strategy_id: id, ticker: sym, rule, price: px, acted: !skip, skip_reason: skip, detail: { vwap, dipPct, dipThresh, avgRangePct, trendPct, hi, vol: last.v, avgVol, spread: spread[sym] } }).select().single();
     if (skip) continue;
 
     const notional = Math.min(equity * 0.30, equity / cfg.max_positions);
