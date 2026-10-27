@@ -52,6 +52,8 @@ Deno.serve(async (req) => {
   const makerSide = (cfg.maker_fee_pct_side ?? cfg.fee_pct_side ?? 0) / 100;
 
   // ---- manage open positions first (exits always allowed, even if halted) ----
+  const stale: any[] = []; // past max_hold but not losing: keep unless a new signal needs the slot
+  const hardCapMin = (cfg.max_hold_min ?? 90) * 16; // 24h for a 90-min strategy
   for (const t of open) {
     const px = mark[t.ticker]; if (!px) continue;
     const entry = Number(t.entry_price);
@@ -71,15 +73,17 @@ Deno.serve(async (req) => {
       const armed = (hw / entry - 1) * 100 >= cfg.trail_arm_pct!;
       if (armed && (px / hw - 1) * 100 <= -cfg.trail_pct!) reason = "trail";
       else if (!armed && chg <= -cfg.stop_pct) reason = "stop";
-      else if (held >= cfg.max_hold_min && !armed) reason = "time";
-      else if (held >= cfg.max_hold_min * 4) reason = "time"; // armed trades get longer, but not forever
+      else if (held >= hardCapMin) reason = "time cap";
+      else if (held >= cfg.max_hold_min && !armed) stale.push({ ...t, px, held });
     } else {
       if (chg >= cfg.target_pct && !(t as any).tp_order_id) reason = "target"; // fallback if no resting TP
       else if (chg <= -cfg.stop_pct) reason = "stop";
-      else if (held >= cfg.max_hold_min) reason = "time";
+      else if (held >= hardCapMin) reason = "time cap";
+      else if (held >= cfg.max_hold_min) stale.push({ ...t, px, held });
     }
     if (reason) await exitTrade(id, t, px, reason, feeSide, !crypto);
   }
+  stale.sort((a, b) => b.held - a.held); // oldest first
 
   const gate = await riskGate(id, equity);
   if (gate) {
@@ -90,7 +94,7 @@ Deno.serve(async (req) => {
 
   const { data: openNow } = await sb.from("trades").select("ticker").eq("strategy_id", id).is("exited_at", null);
   let slots = cfg.max_positions - (openNow?.length ?? 0);
-  if (slots <= 0) return json({ ok: true, message: "max positions" });
+  if (slots <= 0 && !stale.length) return json({ ok: true, message: "max positions" });
 
   let pdtLeft = Infinity;
   if (!crypto && cfg.pdt_cap && equity < 25000) {
@@ -100,7 +104,7 @@ Deno.serve(async (req) => {
 
   // ---- entries ----
   for (const sym of cfg.tickers) {
-    if (slots <= 0) break;
+    if (slots <= 0 && !stale.length) break;
     if (openNow?.some((o) => o.ticker === sym)) continue;
     const b: Bar[] = bars.bars?.[sym] ?? [];
     if (b.length < cfg.breakout_bars + 2) continue;
@@ -135,6 +139,13 @@ Deno.serve(async (req) => {
     else if (pdtLeft <= 0) skip = "PDT cap";
     const { data: sig } = await sb.from("signals").insert({ strategy_id: id, ticker: sym, rule, price: px, acted: !skip, skip_reason: skip, detail: { vwap, dipPct, dipThresh, avgRangePct, trendPct, hi, vol: last.v, avgVol, spread: spread[sym] } }).select().single();
     if (skip) continue;
+
+    // no free slot but a stale trade is sitting idle: that one makes way for this signal
+    if (slots <= 0) {
+      const old = stale.shift()!;
+      await exitTrade(id, old, old.px, "time (slot needed)", feeSide, !crypto);
+      slots++;
+    }
 
     const notional = Math.min(equity * 0.30, equity / cfg.max_positions);
     const qty = crypto ? +(notional / px).toFixed(6) : Math.floor(notional / px);
