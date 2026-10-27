@@ -6,6 +6,7 @@ type Cfg = {
   tickers: string[]; target_pct: number; stop_pct: number; max_hold_min: number; max_positions: number;
   vwap_dip_pct: number; breakout_bars: number; vol_mult: number; spread_pct: number; pdt_cap?: number; fee_pct_side?: number;
   trail_arm_pct?: number; trail_pct?: number; // D: trailing stop instead of fixed target
+  maker_fee_pct_side?: number; // fee when our resting limit order fills
 };
 
 /** Runs every minute. ?strategy=B (stocks, market hours), C (crypto, fixed target) or D (crypto, trailing stop). */
@@ -46,11 +47,18 @@ Deno.serve(async (req) => {
 
   const { equity, open } = await strategyEquity(id, mark);
   const feeSide = (cfg.fee_pct_side ?? 0) / 100;
+  const makerSide = (cfg.maker_fee_pct_side ?? cfg.fee_pct_side ?? 0) / 100;
 
   // ---- manage open positions first (exits always allowed, even if halted) ----
   for (const t of open) {
     const px = mark[t.ticker]; if (!px) continue;
     const entry = Number(t.entry_price);
+    // resting take-profit filled between ticks?
+    if ((t as any).tp_order_id) {
+      const tp = await alpaca.order((t as any).tp_order_id);
+      if (tp.status === "filled") { await closeFromFill(id, t, tp, "target", makerSide); continue; }
+      if (["canceled", "rejected", "expired"].includes(tp.status)) await sb.from("trades").update({ tp_order_id: null }).eq("id", t.id);
+    }
     const chg = (px / entry - 1) * 100;
     const held = (Date.now() - new Date((t as any).entered_at ?? Date.now()).getTime()) / 60e3;
     let reason: string | null = null;
@@ -64,7 +72,7 @@ Deno.serve(async (req) => {
       else if (held >= cfg.max_hold_min && !armed) reason = "time";
       else if (held >= cfg.max_hold_min * 4) reason = "time"; // armed trades get longer, but not forever
     } else {
-      if (chg >= cfg.target_pct) reason = "target";
+      if (chg >= cfg.target_pct && !(t as any).tp_order_id) reason = "target"; // fallback if no resting TP
       else if (chg <= -cfg.stop_pct) reason = "stop";
       else if (held >= cfg.max_hold_min) reason = "time";
     }
@@ -139,17 +147,49 @@ Deno.serve(async (req) => {
       continue;
     }
     const fillPx = Number(filled.filled_avg_price);
-    const fq = Number(filled.filled_qty);
+    let fq = Number(filled.filled_qty);
+    if (crypto) {
+      // Alpaca deducts the crypto buy fee from the coin itself; sell what we actually hold
+      try { const pos = await alpaca.position(sym); fq = Math.min(fq, Number(pos.qty_available ?? pos.qty)); } catch { /* keep filled qty */ }
+    }
     await sb.from("orders").update({ status: "filled", filled_at: filled.filled_at, filled_price: fillPx }).eq("id", row!.id);
-    await sb.from("trades").insert({ strategy_id: id, ticker: sym, entry_order_id: row!.id, entry_price: fillPx, qty: fq, signal_price: px, entered_at: filled.filled_at, fees: fillPx * fq * feeSide, slippage: (fillPx / px - 1) * 100 });
+    const entryFee = fillPx * fq * (filled.order_type === "limit" && Number(filled.filled_avg_price) < limit ? makerSide : feeSide);
+    const { data: tr } = await sb.from("trades").insert({ strategy_id: id, ticker: sym, entry_order_id: row!.id, entry_price: fillPx, qty: fq, signal_price: px, entered_at: filled.filled_at, fees: entryFee, slippage: (fillPx / px - 1) * 100 }).select().single();
+    // fixed-target strategies: rest a take-profit limit sell so spikes between ticks get caught at maker fee
+    if (cfg.trail_pct == null && cfg.target_pct) {
+      try {
+        const tpPx = +(fillPx * (1 + cfg.target_pct / 100)).toFixed(crypto ? 2 : 2);
+        const tp = await alpaca.submit({ symbol: sym, qty: fq, side: "sell", type: "limit", limit_price: tpPx, time_in_force: crypto ? "gtc" : "day", client_order_id: `${id}-tp-${Date.now()}-${sym.replace("/", "")}` });
+        await sb.from("trades").update({ tp_order_id: tp.id }).eq("id", tr!.id);
+        await sb.from("orders").insert({ alpaca_order_id: tp.id, strategy_id: id, ticker: sym, side: "sell", qty: fq, limit_price: tpPx, status: tp.status, raw: tp });
+      } catch (e) { await log(id, "warn", `TP order failed for ${sym}: ${String(e).slice(0, 200)}`); }
+    }
     await log(id, "info", `BUY ${sym} ${fq} @ ${fillPx} (${rule})`);
     slots--; if (!crypto) pdtLeft--;
   }
   return json({ ok: true });
 });
 
+async function closeFromFill(id: string, t: any, st: any, reason: string, exitFeeSide: number) {
+  const sym = t.ticker as string;
+  const exitPx = Number(st.filled_avg_price);
+  const qty = Number(st.filled_qty || t.qty), entry = Number(t.entry_price);
+  await sb.from("orders").update({ status: "filled", filled_at: st.filled_at, filled_price: exitPx }).eq("alpaca_order_id", st.id);
+  const { data: row } = await sb.from("orders").select("id").eq("alpaca_order_id", st.id).single();
+  const gross = (exitPx - entry) * qty;
+  const fees = Number(t.fees ?? 0) + exitPx * qty * exitFeeSide;
+  const enteredAt = new Date(t.entered_at);
+  await sb.from("trades").update({
+    exit_order_id: row?.id ?? null, exit_price: exitPx, exited_at: st.filled_at ?? new Date().toISOString(),
+    gross_pnl: gross, fees, net_pnl: gross - fees, hold_seconds: Math.round((new Date(st.filled_at ?? Date.now()).getTime() - enteredAt.getTime()) / 1000),
+    exit_reason: reason, tp_order_id: null,
+  }).eq("id", t.id);
+  await log(id, "info", `SELL ${sym} ${qty} @ ${exitPx} (${reason}, resting order) net ${(gross - fees).toFixed(2)}`);
+}
+
 async function exitTrade(id: string, t: any, px: number, reason: string, feeSide: number, stocks: boolean) {
   const sym = t.ticker as string;
+  if (t.tp_order_id) { try { await alpaca.cancel(t.tp_order_id); } catch { /* may have just filled; handled next tick */ } }
   const o = await alpaca.submit({ symbol: sym, qty: t.qty, side: "sell", type: "market", time_in_force: stocks ? "day" : "gtc", client_order_id: `${id}-x-${Date.now()}-${sym.replace("/", "")}` });
   let st = o;
   for (let i = 0; i < 5 && st.status !== "filled"; i++) { await new Promise((r) => setTimeout(r, 2000)); st = await alpaca.order(o.id); }
