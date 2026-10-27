@@ -61,7 +61,8 @@ Deno.serve(async (req) => {
 
   const gate = await riskGate(id, equity);
   if (gate) {
-    await sb.from("signals").insert({ strategy_id: id, ticker: "*", rule: "risk_gate", price: 0, acted: false, skip_reason: gate });
+    // only log real risk events, not the routine "not armed" idle state
+    if (gate !== "not armed") await sb.from("signals").insert({ strategy_id: id, ticker: "*", rule: "risk_gate", price: 0, acted: false, skip_reason: gate });
     return json({ ok: true, message: gate });
   }
 
